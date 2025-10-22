@@ -1,568 +1,511 @@
-from qiskit import QuantumCircuit, transpile
-from qiskit_aer import AerSimulator
-import json
+from __future__ import annotations
+
+from typing import List, Dict, Any, Optional, Sequence, Tuple
 from datetime import datetime
+import json
+
+from qiskit import QuantumCircuit
+
 
 class QuantumDeltaDebugger:
     """
-    量子电路Delta Debugging调试器
-    使用DDMin算法找出导致目标态概率损失最严重的电路段
+    量子电路 Delta Debugger（基于 DDMin）
+
+    - 面向已编译到目标后端 ISA 的 `QuantumCircuit`
+    - 通过对比理想模拟 vs 噪声模拟的目标态概率，度量“损失”(loss)
+    - 使用 DDMin 找出导致损失最大的最小段集合
+    - 额外提供“前缀扫描”来定位错误率突增（sudden spike）的层位点
     """
-    
-    def __init__(self, executor, target_states, tolerance=0.02):
-        """
-        初始化Delta Debugger
-        
-        Args:
-            executor: 量子执行器实例
-            target_states: 目标状态列表
-            tolerance: 概率损失容忍度
-        """
+
+    def __init__(
+        self,
+        executor,
+        target_states: Sequence[int],
+        tolerance: float = 0.02,
+    ) -> None:
         self.executor = executor
-        self.target_states = target_states
-        self.tolerance = tolerance
-        self.ideal_sim = AerSimulator()
-        self.debug_history = []
-        self.test_count = 0
-        self.logical_n_qubits = None  # number of data qubits to evaluate on
-        
+        self.target_states = list(target_states)
+        self.tolerance = float(tolerance)
+
+        self.original_circuit: Optional[QuantumCircuit] = None
+        self.segments: List[Dict[str, Any]] = []
+        self.logical_n_qubits: Optional[int] = None
+        self.test_count: int = 0
+        self.ddmin_log: List[Dict[str, Any]] = []
+        self.evaluations: List[Dict[str, Any]] = []
+
+    # ---------- helpers ----------
     def _ensure_measured(self, circ: QuantumCircuit) -> QuantumCircuit:
-        """Ensure the circuit has exactly one set of measurements.
+        # 如果已存在测量，直接返回（不再追加）
+        if any(inst.operation.name == "measure" for inst in circ.data):
+            return circ
+        n_q = circ.num_qubits
+        # 确保经典位数量足够；显式一一测量（qubit i -> clbit i）
+        if circ.num_clbits < n_q:
+            from qiskit import ClassicalRegister
+            circ = circ.copy()
+            circ.add_register(ClassicalRegister(n_q - circ.num_clbits))
+        for i in range(n_q):
+            circ.measure(i, i)
+        return circ
 
-        - If the circuit already contains measure ops, return as-is.
-        - If there are fewer classical bits than qubits (common for algorithmic
-          circuits without classical regs), create a new circuit with matching
-          classical bits, copy non-measure ops, then measure_all.
-        - Otherwise, call measure_all once.
-        """
-        try:
-            if any(inst.operation.name == "measure" for inst in circ.data):
-                return circ
+    def _adaptive_tol(self, shots: int, p: float) -> float:
+        import math
+        sigma = math.sqrt(max(p * (1 - p), 1e-9) / max(shots, 1))
+        return max(self.tolerance, 2.0 * sigma)
 
-            if circ.num_clbits < circ.num_qubits:
-                # Rebuild with enough classical bits and add a single measurement set
-                new_qc = QuantumCircuit(circ.num_qubits, circ.num_qubits)
-                for inst in circ.data:
-                    if inst.operation.name != "measure":
-                        new_qc.append(inst.operation, inst.qubits, inst.clbits)
-                new_qc.measure_all()
-                return new_qc
-            else:
-                circ.measure_all()
-                return circ
-        except Exception:
-            # Fallback: ensure a minimal measurable circuit
-            new_qc = QuantumCircuit(circ.num_qubits, max(circ.num_qubits, circ.num_clbits))
-            for inst in getattr(circ, 'data', []):
-                if getattr(inst.operation, 'name', None) != "measure":
-                    new_qc.append(inst.operation, inst.qubits, inst.clbits)
-            new_qc.measure_all()
-            return new_qc
-
-    def _bitstr_for_state(self, circuit: QuantumCircuit, state_int: int) -> str:
-        """Return the bitstring key for counts matching q[i]->c[i] (measure_all case).
-
-        For measure_all with direct q[i]→c[i], Qiskit's counts bitstring is in classical
-        register order, which corresponds to reversing the natural binary order.
-        """
-        n = circuit.num_qubits
-        return format(state_int, f'0{n}b')[::-1]
-
-    def extract_circuit_segments(self, circuit):
-        """
-        将量子电路分解为可测试的段
-        
-        Args:
-            circuit: 量子电路
-            
-        Returns:
-            list: 电路段列表，每个段包含指令和位置信息
-        """
-        segments = []
-        
-        # 按层分组指令
-        current_layer = []
+    # ---------- segmentation ----------
+    def extract_circuit_segments(self, circuit: QuantumCircuit) -> List[Dict[str, Any]]:
+        segments: List[Dict[str, Any]] = []
+        current_layer: List[Dict[str, Any]] = []
         for i, instruction in enumerate(circuit.data):
-            if instruction.operation.name == 'measure':
-                continue  # 跳过测量指令
-                
-            current_layer.append({
-                'instruction': instruction,
-                'index': i,
-                'operation': instruction.operation.name,
-                'qubits': [circuit.find_bit(qubit).index for qubit in instruction.qubits],
-                'params': getattr(instruction.operation, 'params', [])
-            })
-            
-            # 检查是否应该结束当前层
+            if instruction.operation.name in ["measure", "barrier", "delay", "reset"]:
+                continue
+            current_layer.append(
+                {
+                    "instruction": instruction,
+                    "index": i,
+                    "operation": instruction.operation.name,
+                    "qubits": [circuit.find_bit(q).index for q in instruction.qubits],
+                    "params": getattr(instruction.operation, "params", []),
+                }
+            )
             if self._should_end_layer(current_layer, instruction):
                 if current_layer:
-                    segments.append({
-                        'instructions': current_layer.copy(),
-                        'layer_id': len(segments),
-                        'description': self._describe_layer(current_layer)
-                    })
+                    segments.append(
+                        {
+                            "instructions": current_layer.copy(),
+                            "layer_id": len(segments),
+                            "description": self._describe_layer(current_layer),
+                        }
+                    )
                     current_layer = []
-        
-        # 添加最后一层
         if current_layer:
-            segments.append({
-                'instructions': current_layer.copy(),
-                'layer_id': len(segments),
-                'description': self._describe_layer(current_layer)
-            })
-        
+            segments.append(
+                {
+                    "instructions": current_layer.copy(),
+                    "layer_id": len(segments),
+                    "description": self._describe_layer(current_layer),
+                }
+            )
         return segments
-    
-    def _should_end_layer(self, current_layer, instruction):
-        """判断是否应该结束当前层"""
-        # 简单的分层策略：每5个指令或遇到控制门时分层
+
+    def _should_end_layer(self, current_layer: List[Dict[str, Any]], instruction) -> bool:
         if len(current_layer) >= 5:
             return True
-        if instruction.operation.name in ['cx', 'cz', 'mcx', 'ccx']:
+        if instruction.operation.name in ["cx", "cz", "mcx", "ccx"]:
+            return True
+        # 若遇到条件门，截断层以避免跨条件边界
+        if getattr(instruction.operation, "condition", None) is not None:
             return True
         return False
-    
-    def _describe_layer(self, layer):
-        """描述层的内容"""
-        ops = [inst['operation'] for inst in layer]
-        op_counts = {}
-        for op in ops:
+
+    def _describe_layer(self, layer: List[Dict[str, Any]]) -> str:
+        op_counts: Dict[str, int] = {}
+        for inst in layer:
+            op = inst["operation"]
             op_counts[op] = op_counts.get(op, 0) + 1
-        
-        description = ", ".join([f"{count}×{op}" for op, count in op_counts.items()])
-        return f"Layer({description})"
-    
-    def build_circuit_without_segments(self, original_circuit, segments_to_exclude):
-        """
-        构建排除指定段的电路
-        
-        Args:
-            original_circuit: 原始电路
-            segments_to_exclude: 要排除的段的索引列表
-            
-        Returns:
-            QuantumCircuit: 修改后的电路
-        """
-        # 创建空电路外壳（优先保留寄存器结构；测量稍后统一处理）
+        return ", ".join([f"{cnt}×{op}" for op, cnt in op_counts.items()]) or "(empty)"
+
+    # ---------- circuit builders ----------
+    def build_circuit_without_segments(
+        self, original_circuit: QuantumCircuit, segments_to_exclude: Sequence[int]
+    ) -> QuantumCircuit:
         try:
             new_circuit = original_circuit.copy_empty_like()
         except Exception:
             new_circuit = QuantumCircuit(original_circuit.num_qubits, original_circuit.num_clbits)
 
-        # 计算要排除的指令索引（源自分段，不含测量）
         excluded_indices = set()
         for seg_idx in segments_to_exclude:
-            if seg_idx < len(self.segments):
-                for inst in self.segments[seg_idx]['instructions']:
-                    excluded_indices.add(inst['index'])
+            if 0 <= seg_idx < len(self.segments):
+                for inst in self.segments[seg_idx]["instructions"]:
+                    excluded_indices.add(inst["index"])
 
-        # 追加非排除的非测量指令；避免重复测量
-        for i, (op, qargs, cargs) in enumerate(original_circuit.data):
-            if getattr(op, 'name', None) == 'measure':
+        for i, inst in enumerate(original_circuit.data):
+            op = inst.operation
+            qargs = inst.qubits
+            # 跳过测量及非执行指令
+            if getattr(op, "name", None) in ["measure", "barrier", "delay", "reset"]:
                 continue
-            if i not in excluded_indices:
-                # 重新映射量子位到新电路上的对应位置
-                try:
-                    q_indices = [original_circuit.find_bit(q).index for q in qargs]
-                    mapped_qargs = [new_circuit.qubits[idx] for idx in q_indices]
-                except Exception:
-                    # 回退：直接使用顺序映射（假定顺序一致）
-                    mapped_qargs = [new_circuit.qubits[j] for j in range(len(qargs))]
-                new_circuit.append(op, mapped_qargs, [])
+            if i in excluded_indices:
+                continue
+            try:
+                q_indices = [original_circuit.find_bit(q).index for q in qargs]
+                mapped_qargs = [new_circuit.qubits[idx] for idx in q_indices]
+            except Exception:
+                mapped_qargs = [new_circuit.qubits[j] for j in range(len(qargs))]
+            new_circuit.append(op, mapped_qargs, [])
 
-        # 统一只测量一次：若设置了逻辑数据比特，只测前 n 个以避免把辅比特带入
         if self.logical_n_qubits is None:
             new_circuit = self._ensure_measured(new_circuit)
         else:
-            # 确保有足够经典位
-            if new_circuit.num_clbits < self.logical_n_qubits:
-                tmp = QuantumCircuit(new_circuit.num_qubits, self.logical_n_qubits)
+            n = self.logical_n_qubits
+            if new_circuit.num_clbits < n:
+                tmp = QuantumCircuit(new_circuit.num_qubits, n)
                 for inst in new_circuit.data:
-                    if getattr(inst.operation, 'name', None) != 'measure':
+                    if getattr(inst.operation, "name", None) != "measure":
                         tmp.append(inst.operation, inst.qubits, inst.clbits)
                 new_circuit = tmp
-            # 添加前 n 个数据比特的测量
-            for i in range(self.logical_n_qubits):
+            for i in range(n):
                 new_circuit.measure(i, i)
         return new_circuit
-    
-    def evaluate_circuit(self, circuit, shots=4096):
-        """
-        评估电路的目标态概率（理想模拟 vs 带噪声模拟）
-        
-        Args:
-            circuit: 量子电路
-            shots: 测量次数
-            
-        Returns:
-            tuple: (ideal_target_prob, noisy_target_prob, ideal_counts)
-        """
-        self.test_count += 1
-        
+
+    def build_circuit_with_segments(
+        self, original_circuit: QuantumCircuit, segments_to_include: Sequence[int]
+    ) -> QuantumCircuit:
+        include_set = set(segments_to_include)
         try:
-            # 使用统一执行器跑理想模拟
-            ideal_res = self.executor.run_circuit(circuit, execution_type="ideal_simulator", shots=shots)
-            if not ideal_res.get('success'):
-                raise RuntimeError(f"Ideal simulation failed: {ideal_res.get('error')}")
-            ideal_counts = ideal_res.get('counts', {})
-            # 将 counts 投影到逻辑数据比特空间（小端）
-            n_data = self.logical_n_qubits or circuit.num_qubits
-            from collections import defaultdict
-            def _project_counts_to_data_qubits(counts, n_data_qubits):
-                acc = defaultdict(int)
-                for k, v in (counts or {}).items():
-                    bits_le = k.replace(" ", "")[::-1]
-                    key = bits_le[:n_data_qubits]
-                    acc[key] += v
-                return dict(acc)
-            proj_ideal = _project_counts_to_data_qubits(ideal_counts, n_data)
-            total_ideal = max(1, sum(proj_ideal.values()))
-            ideal_target_prob = 0.0
-            def _target_key_le(state_int, n_bits):
-                return format(state_int, f'0{n_bits}b')
-            for state in self.target_states:
-                key = _target_key_le(state, n_data)
-                ideal_target_prob += proj_ideal.get(key, 0) / total_ideal
-            
-            # 使用带噪声模拟器（从后端构建噪声）
-            noisy_shots = max(1, shots // 2)
-            noisy_target_prob = 0.0
+            new_circuit = original_circuit.copy_empty_like()
+        except Exception:
+            new_circuit = QuantumCircuit(original_circuit.num_qubits, original_circuit.num_clbits)
+        include_indices: set[int] = set()
+        for seg_idx in include_set:
+            if 0 <= seg_idx < len(self.segments):
+                for inst in self.segments[seg_idx]["instructions"]:
+                    include_indices.add(inst["index"])
+        for i, inst in enumerate(original_circuit.data):
+            op = inst.operation
+            qargs = inst.qubits
+            # 跳过测量及非执行指令
+            if getattr(op, "name", None) in ["measure", "barrier", "delay", "reset"]:
+                continue
+            if i not in include_indices:
+                continue
             try:
-                noisy_res = self.executor.run_circuit(circuit, execution_type="noisy_simulator", shots=noisy_shots)
-                if noisy_res.get('success'):
-                    noisy_counts = noisy_res.get('counts', {})
-                    proj_noisy = _project_counts_to_data_qubits(noisy_counts, n_data)
-                    total_noisy = max(1, sum(proj_noisy.values()))
-                    for state in self.target_states:
-                        key = _target_key_le(state, n_data)
-                        noisy_target_prob += proj_noisy.get(key, 0) / total_noisy
-                else:
-                    print(f"带噪声模拟失败: {noisy_res.get('error')}")
-            except Exception as ne:
-                print(f"带噪声模拟异常: {ne}")
-                noisy_target_prob = 0.0
-            
-            return ideal_target_prob, noisy_target_prob, ideal_counts
-            
-        except Exception as e:
-            print(f"电路评估失败: {e}")
-            return 0.0, 0.0, {}
-    
-    def ddmin(self, segments):
-        """
-        DDMin算法实现
-        
-        Args:
-            segments: 电路段列表
-            
-        Returns:
-            list: 导致问题的最小段集合
-        """
-        print(f"\n开始DDMin调试，共{len(segments)}个段...")
-        
-        # 评估完整电路
-        full_circuit = self.build_circuit_without_segments(self.original_circuit, [])
-        full_ideal_prob, full_noisy_prob, _ = self.evaluate_circuit(full_circuit)
-        
-        print(f"完整电路 - 理想概率: {full_ideal_prob:.4f}, 噪声概率: {full_noisy_prob:.4f}")
-        
-        # 评估空电路（只有初始化和测量）
-        n_data = self.logical_n_qubits or self.original_circuit.num_qubits
-        empty_circuit = QuantumCircuit(n_data, n_data)
-        for i in range(n_data):
-            empty_circuit.h(i)  # 初始化为均匀叠加态
-            empty_circuit.measure(i, i)
-        
-        empty_ideal_prob, empty_noisy_prob, _ = self.evaluate_circuit(empty_circuit)
-        print(f"空电路 - 理想概率: {empty_ideal_prob:.4f}, 噪声概率: {empty_noisy_prob:.4f}")
-        
-        # 计算目标概率损失
-        target_loss = full_ideal_prob - full_noisy_prob
-        print(f"目标概率损失: {target_loss:.4f}")
-        
-        if target_loss < self.tolerance:
-            print("概率损失在容忍范围内，无需调试")
+                q_indices = [original_circuit.find_bit(q).index for q in qargs]
+                mapped_qargs = [new_circuit.qubits[idx] for idx in q_indices]
+            except Exception:
+                mapped_qargs = [new_circuit.qubits[j] for j in range(len(qargs))]
+            new_circuit.append(op, mapped_qargs, [])
+        if self.logical_n_qubits is None:
+            new_circuit = self._ensure_measured(new_circuit)
+        else:
+            n = self.logical_n_qubits
+            if new_circuit.num_clbits < n:
+                tmp = QuantumCircuit(new_circuit.num_qubits, n)
+                for inst in new_circuit.data:
+                    if getattr(inst.operation, "name", None) != "measure":
+                        tmp.append(inst.operation, inst.qubits, inst.clbits)
+                new_circuit = tmp
+            for i in range(n):
+                new_circuit.measure(i, i)
+        return new_circuit
+
+    # ---------- evaluation ----------
+    def evaluate_circuit(self, circuit: QuantumCircuit, shots: int = 2048) -> Tuple[float, float, Dict[str, int]]:
+        self.test_count += 1
+
+        def _project_counts(counts: Dict[str, int], n_bits: int) -> Dict[str, int]:
+            from collections import defaultdict
+            acc = defaultdict(int)
+            for k, v in (counts or {}).items():
+                # 约定使用小端序：bitstring 右端为最高编号量子比特；目标态也需按小端提供
+                bits_le = k.replace(" ", "")[::-1]
+                acc[bits_le[:n_bits]] += v
+            return dict(acc)
+
+        n_data = self.logical_n_qubits or circuit.num_qubits
+
+        ideal = self.executor.run_circuit(circuit, execution_type="ideal_simulator", shots=shots)
+        if not ideal.get("success"):
+            raise RuntimeError(f"Ideal simulation failed: {ideal.get('error')}")
+        ideal_counts = _project_counts(ideal.get("counts", {}), n_data)
+        total_ideal = max(1, sum(ideal_counts.values()))
+
+        def _key(state: int) -> str:
+            return format(state, f"0{n_data}b")
+
+        ideal_target_prob = sum(ideal_counts.get(_key(s), 0) for s in self.target_states) / total_ideal
+
+        noisy = self.executor.run_circuit(circuit, execution_type="real_device", shots=shots)
+        if not noisy.get("success"):
+            # 一次重试，仍失败则抛错，避免把失败当作 0 概率
+            noisy = self.executor.run_circuit(circuit, execution_type="real_device", shots=shots)
+        if not noisy.get("success"):
+            raise RuntimeError(f"Noisy simulation failed: {noisy.get('error')}")
+        noisy_counts = _project_counts(noisy.get("counts", {}), n_data)
+        total_noisy = max(1, sum(noisy_counts.values()))
+        noisy_target_prob = sum(noisy_counts.get(_key(s), 0) for s in self.target_states) / total_noisy
+
+        return ideal_target_prob, noisy_target_prob, ideal.get("counts", {})
+
+    # ---------- ddmin ----------
+    def ddmin(self, baseline_loss: Optional[float] = None) -> List[int]:
+        if self.original_circuit is None:
             return []
-        
-        # DDMin主循环
-        candidates = list(range(len(segments)))
-        n = 2  # 分割粒度
-        iteration_count = 0
-        
+        shots = 2048
+        full_circuit = self.build_circuit_without_segments(self.original_circuit, [])
+        full_ideal, full_noisy, _ = self.evaluate_circuit(full_circuit, shots=shots)
+        loss = full_ideal - full_noisy if baseline_loss is None else baseline_loss
+        # 清空 ddmin 日志
+        self.ddmin_log.clear()
+
+        candidates = list(range(len(self.segments)))
+        n = 2
         while len(candidates) >= 2:
-            iteration_count += 1
-            print(f"\n{'='*50}")
-            print(f"DDMin迭代 #{iteration_count}: {len(candidates)}个候选段, 分割粒度: {n}")
-            print(f"当前基准损失: {target_loss:.4f}")
-            print(f"容忍度: {self.tolerance:.4f}")
-            print(f"{'='*50}")
-            
-            # 将候选段分割为n个子集
-            subsets = self._split_into_subsets(candidates, n)
-            any_reduction = False
-            
-            # 测试每个子集的补集
-            for i, subset in enumerate(subsets):
-                complement = [seg for seg in candidates if seg not in subset]
-                
-                if not complement:  # 跳过空补集
+            subsets = self._split(candidates, n)
+            progressed = False
+            for subset in subsets:
+                complement = [i for i in candidates if i not in subset]
+                if not complement:
                     continue
-                
-                print(f"\n  测试子集{i+1}/{len(subsets)}：排除该子集（等价于保留其补集）")
-                print(f"    被排除段: {subset}")
-                print(f"    被保留段(补集): {complement}")
-                
-                # 构建排除当前子集的电路
-                test_circuit = self.build_circuit_without_segments(self.original_circuit, subset)
-                test_ideal_prob, test_noisy_prob, _ = self.evaluate_circuit(test_circuit)
-                test_loss = test_ideal_prob - test_noisy_prob
-                
-                # 计算损失变化
-                loss_change = target_loss - test_loss
-                loss_improvement = loss_change > self.tolerance
-                
-                print(f"    测试结果:")
-                print(f"      理想概率: {test_ideal_prob:.4f}")
-                print(f"      噪声概率: {test_noisy_prob:.4f}")
-                print(f"      当前损失: {test_loss:.4f}")
-                print(f"      损失变化: {loss_change:+.4f} ({'减少' if loss_change > 0 else '增加'})")
-                print(f"      基准损失: {target_loss:.4f}")
-                
-                # 如果排除这个子集后损失显著减少，说明这个子集包含问题
-                if loss_improvement:
-                    print(f"    ✓ 找到问题子集! 损失显著减少: {loss_change:.4f}")
-                    print(f"    ✓ 更新候选集: {subset}")
+                test_circ = self.build_circuit_without_segments(self.original_circuit, subset)
+                t_ideal, t_noisy, _ = self.evaluate_circuit(test_circ, shots=shots)
+                t_loss = t_ideal - t_noisy
+                tol_t = self._adaptive_tol(shots, 0.5 * (t_ideal + t_noisy))
+                # 记录 ddmin 评估
+                self.evaluations.append({
+                    "mode": "ddmin",
+                    "excluded": subset,
+                    "included": None,
+                    "shots": shots,
+                    "ideal": t_ideal,
+                    "noisy": t_noisy,
+                    "loss": t_loss,
+                })
+                log_entry = {
+                    "action": "test_subset",
+                    "excluded": subset,
+                    "kept": [i for i in candidates if i in subset],
+                    "ideal": t_ideal,
+                    "noisy": t_noisy,
+                    "loss": t_loss,
+                    "tol": tol_t,
+                    "prev_loss": loss,
+                    "progressed": False,
+                }
+                if (loss - t_loss) > tol_t:
                     candidates = subset
-                    target_loss = test_loss
-                    any_reduction = True
+                    loss = t_loss
+                    log_entry["progressed"] = True
+                    self.ddmin_log.append(log_entry)
+                    progressed = True
                     break
-                else:
-                    print(f"    ✗ 损失变化不显著，继续测试下一个子集")
-            
-            if not any_reduction:
+                # 尝试测 complement
+                comp_circ = self.build_circuit_without_segments(self.original_circuit, complement)
+                c_ideal, c_noisy, _ = self.evaluate_circuit(comp_circ, shots=shots)
+                c_loss = c_ideal - c_noisy
+                tol_c = self._adaptive_tol(shots, 0.5 * (c_ideal + c_noisy))
+                # 记录 ddmin 评估（complement）
+                self.evaluations.append({
+                    "mode": "ddmin",
+                    "excluded": complement,
+                    "included": None,
+                    "shots": shots,
+                    "ideal": c_ideal,
+                    "noisy": c_noisy,
+                    "loss": c_loss,
+                })
+                log_entry_comp = {
+                    "action": "test_complement",
+                    "excluded": complement,
+                    "kept": [i for i in candidates if i in subset],
+                    "ideal": c_ideal,
+                    "noisy": c_noisy,
+                    "loss": c_loss,
+                    "tol": tol_c,
+                    "prev_loss": loss,
+                    "progressed": False,
+                }
+                if (loss - c_loss) > tol_c:
+                    candidates = complement
+                    loss = c_loss
+                    log_entry_comp["progressed"] = True
+                    self.ddmin_log.append(log_entry_comp)
+                    progressed = True
+                    break
+                # 两者都未推进，记录两条日志
+                self.ddmin_log.append(log_entry)
+                self.ddmin_log.append(log_entry_comp)
+            if not progressed:
                 if n < len(candidates):
-                    print(f"\n  所有子集测试完成，未找到显著改进")
-                    print(f"  增加分割粒度: {n} → {min(n * 2, len(candidates))}")
-                    n = min(n * 2, len(candidates))  # 增加分割粒度
+                    n = min(n * 2, len(candidates))
                 else:
-                    print(f"\n  无法进一步缩小，算法结束")
-                    break  # 无法进一步缩小
-        
-        print(f"\n{'='*50}")
-        print(f"DDMin算法完成!")
-        print(f"最终候选段: {candidates}")
-        print(f"最终损失: {target_loss:.4f}")
-        print(f"{'='*50}")
-        
+                    break
         return candidates
-    
-    def _split_into_subsets(self, items, n):
-        """将列表分割为n个大致相等的子集"""
+
+    def _split(self, items: List[int], n: int) -> List[List[int]]:
         if n >= len(items):
-            return [[item] for item in items]
-        
-        chunk_size = len(items) // n
-        remainder = len(items) % n
-        
-        subsets = []
+            return [[x] for x in items]
+        size = len(items) // n
+        rem = len(items) % n
+        out: List[List[int]] = []
         start = 0
         for i in range(n):
-            end = start + chunk_size + (1 if i < remainder else 0)
+            end = start + size + (1 if i < rem else 0)
             if start < len(items):
-                subsets.append(items[start:end])
+                out.append(items[start:end])
             start = end
-        
-        return [subset for subset in subsets if subset]  # 过滤空子集
-    
-    def analyze_problematic_segments(self, problematic_segments):
-        """
-        分析有问题的段
-        
-        Args:
-            problematic_segments: 有问题的段索引列表
-            
-        Returns:
-            dict: 分析结果
-        """
-        analysis = {
-            'segment_count': len(problematic_segments),
-            'segments': [],
-            'operation_analysis': {},
-            'qubit_analysis': {},
-            'recommendations': []
+        return [s for s in out if s]
+
+    # ---------- spike scan ----------
+    def scan_loss_by_prefix(self, shots: int = 1024) -> Dict[str, Any]:
+        if self.original_circuit is None:
+            raise RuntimeError("original_circuit is not set")
+        n_seg = len(self.segments)
+        curve: List[Dict[str, Any]] = []
+        for i in range(n_seg):
+            include = list(range(i + 1))  # 前 i 层（含）
+            test = self.build_circuit_with_segments(self.original_circuit, include)
+            p_ideal, p_noisy, _ = self.evaluate_circuit(test, shots=shots)
+            loss = p_ideal - p_noisy
+            curve.append({
+                "layer_id": i,
+                "included_segments": include,
+                "ideal": p_ideal,
+                "noisy": p_noisy,
+                "loss": loss,
+            })
+            # 记录 prefix 评估
+            self.evaluations.append({
+                "mode": "prefix",
+                "excluded": None,
+                "included": include,
+                "shots": shots,
+                "ideal": p_ideal,
+                "noisy": p_noisy,
+                "loss": loss,
+            })
+        # 查找相邻差分的最大上升（spike）
+        spike_idx = None
+        spike_delta = 0.0
+        for k in range(1, len(curve)):
+            delta = curve[k]["loss"] - curve[k - 1]["loss"]
+            if delta > spike_delta:
+                spike_delta = delta
+                spike_idx = k
+        return {
+            "curve": curve,  # [(layer_idx, loss)]
+            "spike_index": spike_idx,  # None 或 首次显著突增的层索引
+            "spike_delta": spike_delta,
         }
-        
-        all_operations = []
-        all_qubits = set()
-        
-        for seg_idx in problematic_segments:
-            if seg_idx < len(self.segments):
-                segment = self.segments[seg_idx]
-                seg_info = {
-                    'layer_id': segment['layer_id'],
-                    'description': segment['description'],
-                    'instructions': len(segment['instructions']),
-                    'operations': []
-                }
-                
-                for inst in segment['instructions']:
-                    op_info = {
-                        'operation': inst['operation'],
-                        'qubits': inst['qubits'],
-                        'params': inst['params']
-                    }
-                    seg_info['operations'].append(op_info)
-                    all_operations.append(inst['operation'])
-                    all_qubits.update(inst['qubits'])
-                
-                analysis['segments'].append(seg_info)
-        
-        # 操作统计
-        from collections import Counter
-        op_counts = Counter(all_operations)
-        analysis['operation_analysis'] = dict(op_counts)
-        
-        # 量子比特统计
-        analysis['qubit_analysis']['affected_qubits'] = list(all_qubits)
-        analysis['qubit_analysis']['qubit_count'] = len(all_qubits)
-        
-        # 生成建议
-        if 'mcx' in op_counts or 'ccx' in op_counts:
-            analysis['recommendations'].append("多控制门是主要错误源，考虑优化或替换")
-        
-        if len(all_qubits) > 6:
-            analysis['recommendations'].append("涉及量子比特过多，考虑减少并行度")
-        
-        if 'x' in op_counts and op_counts['x'] > 10:
-            analysis['recommendations'].append("X门过多可能导致累积误差")
-        
-        return analysis
-    
-    def debug_circuit(self, circuit, n_qubits, target_states):
-        """
-        主调试入口
-        
-        Args:
-            circuit: 要调试的量子电路
-            n_qubits: 量子比特数
-            target_states: 目标状态列表
-            
-        Returns:
-            dict: 调试结果
-        """
+
+    # ---------- public API ----------
+    def debug_circuit(
+        self,
+        circuit: QuantumCircuit,
+        n_qubits: int,
+        target_states: Sequence[int],
+    ) -> Dict[str, Any]:
         self.original_circuit = circuit
-        self.target_states = target_states
+        self.target_states = list(target_states)
+        self.logical_n_qubits = int(n_qubits)
         self.test_count = 0
-        # 设定逻辑数据比特数量，用于测量与counts投影
-        self.logical_n_qubits = n_qubits
-        
-        print(f"\n{'='*60}")
-        print(f"量子电路Delta Debugging分析")
-        print(f"{'='*60}")
-        print(f"电路量子比特数: {n_qubits}")
-        print(f"目标状态: {target_states}")
-        print(f"容忍度: {self.tolerance}")
-        
-        # 提取电路段
+        self.ddmin_log.clear()
+        self.evaluations.clear()
+
         self.segments = self.extract_circuit_segments(circuit)
-        print(f"电路分解为 {len(self.segments)} 个段:")
-        for i, seg in enumerate(self.segments):
-            print(f"  段{i}: {seg['description']}")
-        
-        # 运行DDMin
-        problematic_segments = self.ddmin(self.segments)
-        
-        # 分析结果
-        analysis = self.analyze_problematic_segments(problematic_segments)
-        
-        result = {
-            'total_segments': len(self.segments),
-            'problematic_segments': problematic_segments,
-            'test_count': self.test_count,
-            'analysis': analysis,
-            'segments_info': self.segments
+
+        # 先获得基线损失用于报告
+        full = self.build_circuit_without_segments(self.original_circuit, [])
+        base_ideal, base_noisy, _ = self.evaluate_circuit(full)
+        baseline_loss = base_ideal - base_noisy
+        # 记录 baseline 评估
+        self.evaluations.append({
+            "mode": "baseline",
+            "excluded": [],
+            "included": list(range(len(self.segments))),
+            "shots": 2048,
+            "ideal": base_ideal,
+            "noisy": base_noisy,
+            "loss": baseline_loss,
+        })
+
+        minimal_set = self.ddmin(baseline_loss)
+
+        analysis = self.analyze_problematic_segments(minimal_set)
+        meta = {
+            "timestamp": datetime.now().isoformat(),
+            "logical_n_qubits": self.logical_n_qubits,
+            "bit_endianness": "little (Qiskit bitstrings), reversed to logical order",
+            "evaluation": {
+                "shots_ddmin": 2048,
+                "tolerance_base": self.tolerance,
+                "tolerance_mode": "adaptive_2sigma",
+                "noisy_retry": 1,
+            },
         }
-        
-        self._print_debug_report(result)
-        return result
-    
-    def _print_debug_report(self, result):
-        """打印调试报告"""
-        print(f"\n{'='*60}")
-        print(f"Delta Debugging 报告")
-        print(f"{'='*60}")
-        
-        print(f"总测试次数: {result['test_count']}")
-        print(f"总段数: {result['total_segments']}")
-        print(f"有问题的段数: {len(result['problematic_segments'])}")
-        
-        if result['problematic_segments']:
-            print(f"\n有问题的段:")
-            for seg_idx in result['problematic_segments']:
-                seg = result['segments_info'][seg_idx]
-                print(f"  段{seg_idx}: {seg['description']}")
-                for inst in seg['instructions']:
-                    print(f"    - {inst['operation']} on qubits {inst['qubits']}")
-            
-            analysis = result['analysis']
-            print(f"\n操作统计:")
-            for op, count in analysis['operation_analysis'].items():
-                print(f"  {op}: {count}次")
-            
-            print(f"\n涉及的量子比特: {analysis['qubit_analysis']['affected_qubits']}")
-            
-        else:
-            print("未找到明显的问题段")
-    
-    def save_debug_report(self, result, filename=None):
-        """保存调试报告到JSON文件"""
+
+        return {
+            "meta": meta,
+            "total_segments": len(self.segments),
+            "problematic_segments": minimal_set,
+            "analysis": analysis,
+            "baseline_loss": baseline_loss,
+            "test_count": self.test_count,
+            "segments_info": self.segments,
+            "ddmin_log": self.ddmin_log,
+            "evaluations": self.evaluations,
+        }
+
+    def analyze_problematic_segments(self, problematic_segments: Sequence[int]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
+            "segment_count": len(problematic_segments),
+            "segments": [],
+            "operation_analysis": {},
+            "qubit_analysis": {},
+        }
+        ops: List[str] = []
+        qubits: set[int] = set()
+        for idx in problematic_segments:
+            if 0 <= idx < len(self.segments):
+                seg = self.segments[idx]
+                info = {
+                    "layer_id": seg["layer_id"],
+                    "description": seg["description"],
+                    "instructions": len(seg["instructions"]),
+                    "operations": [],
+                }
+                for inst in seg["instructions"]:
+                    info["operations"].append(
+                        {
+                            "operation": inst["operation"],
+                            "qubits": inst["qubits"],
+                            "params": inst["params"],
+                        }
+                    )
+                    ops.append(inst["operation"])
+                    qubits.update(inst["qubits"])
+                out["segments"].append(info)
+        from collections import Counter
+        out["operation_analysis"] = dict(Counter(ops))
+        out["qubit_analysis"] = {
+            "affected_qubits": sorted(qubits),
+            "qubit_count": len(qubits),
+        }
+        return out
+
+    # ---------- report ----------
+    def save_debug_report(self, result: Dict[str, Any], filename: Optional[str] = None) -> str:
         if filename is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"delta_debug_report_{timestamp}.json"
-        
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(result, f, indent=2, ensure_ascii=False, default=str)
-        
-        print(f"\n调试报告已保存到: {filename}")
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"delta_debug_report_{ts}.json"
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2, default=str)
         return filename
 
-def run_delta_debug_on_grover(executor, n_qubits=6, marked_states=[63]):
-    """
-    对Grover算法运行Delta Debugging
-    
-    Args:
-        executor: 量子执行器
-        n_qubits: 量子比特数
-        marked_states: 目标状态
-    """
-    from program.grover_algorithm import grover_algorithm
-    
-    def get_test_circuit(name, **kwargs):
-        """Get quantum algorithm circuit for delta debugging"""
-        if name == "grover":
-            return grover_algorithm(**kwargs)
-        else:
-            raise ValueError(f"Only grover algorithm is supported for delta debugging")
-    
-    print(f"正在为Grover算法创建Delta Debugger...")
-    
-    # 创建Grover电路
-    circuit = get_test_circuit("grover", n_qubits=n_qubits, marked_states=marked_states)
-    
-    # 创建调试器
-    debugger = QuantumDeltaDebugger(executor, marked_states, tolerance=0.02)
-    
-    # 运行调试
-    result = debugger.debug_circuit(circuit, n_qubits, marked_states)
-    
-    # 保存报告
-    report_file = debugger.save_debug_report(result)
-    
-    return result, report_file
 
-if __name__ == "__main__":
-    print("Delta Debugging模块已加载")
-    print("使用示例:")
-    print("from delta_debug import run_delta_debug_on_grover")
-    print("result, report = run_delta_debug_on_grover(executor, n_qubits=6, marked_states=[63])") 
+def run_delta_debug_on_isa(
+    executor,
+    isa_circuit: QuantumCircuit,
+    n_qubits: int,
+    marked_states: Sequence[int],
+    tolerance: float = 0.02,
+) -> Dict[str, Any]:
+    dbg = QuantumDeltaDebugger(executor=executor, target_states=marked_states, tolerance=tolerance)
+    result = dbg.debug_circuit(isa_circuit, n_qubits=n_qubits, target_states=marked_states)
+    # 同时进行前缀扫描以检测 spike
+    scan_shots = 512
+    loss_scan = dbg.scan_loss_by_prefix(shots=scan_shots)
+    result["loss_scan"] = loss_scan
+    # 更新 meta 中的前缀扫描 shots
+    try:
+        result["meta"]["evaluation"]["shots_prefix_scan"] = scan_shots
+    except Exception:
+        pass
+    # 自动保存报告
+    dbg.save_debug_report(result)
+    return result
+
+
