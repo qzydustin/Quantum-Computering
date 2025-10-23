@@ -9,12 +9,12 @@ from qiskit import QuantumCircuit
 
 class QuantumDeltaDebugger:
     """
-    量子电路 Delta Debugger（基于 DDMin）
+    Quantum Circuit Delta Debugger (based on DDMin)
 
-    - 面向已编译到目标后端 ISA 的 `QuantumCircuit`
-    - 通过对比理想模拟 vs 噪声模拟的目标态概率，度量“损失”(loss)
-    - 使用 DDMin 找出导致损失最大的最小段集合
-    - 额外提供“前缀扫描”来定位错误率突增（sudden spike）的层位点
+    - Targets `QuantumCircuit` compiled to backend ISA
+    - Measures "loss" by comparing ideal vs. noisy simulation of target state probabilities
+    - Uses DDMin to find the minimal set of segments causing the maximum loss
+    - Provides "prefix scan" to locate layers with sudden error rate spikes
     """
 
     def __init__(
@@ -22,10 +22,12 @@ class QuantumDeltaDebugger:
         executor,
         target_states: Sequence[int],
         tolerance: float = 0.02,
+        noisy_execution_type: str = "real_device",
     ) -> None:
         self.executor = executor
         self.target_states = list(target_states)
         self.tolerance = float(tolerance)
+        self.noisy_execution_type = noisy_execution_type  # "real_device" or "noisy_simulator"
 
         self.original_circuit: Optional[QuantumCircuit] = None
         self.segments: List[Dict[str, Any]] = []
@@ -36,11 +38,11 @@ class QuantumDeltaDebugger:
 
     # ---------- helpers ----------
     def _ensure_measured(self, circ: QuantumCircuit) -> QuantumCircuit:
-        # 如果已存在测量，直接返回（不再追加）
+        # If measurements already exist, return directly (no need to append)
         if any(inst.operation.name == "measure" for inst in circ.data):
             return circ
         n_q = circ.num_qubits
-        # 确保经典位数量足够；显式一一测量（qubit i -> clbit i）
+        # Ensure enough classical bits; explicitly measure one-to-one (qubit i -> clbit i)
         if circ.num_clbits < n_q:
             from qiskit import ClassicalRegister
             circ = circ.copy()
@@ -95,7 +97,7 @@ class QuantumDeltaDebugger:
             return True
         if instruction.operation.name in ["cx", "cz", "mcx", "ccx"]:
             return True
-        # 若遇到条件门，截断层以避免跨条件边界
+        # If a conditional gate is encountered, cut the layer to avoid crossing conditional boundaries
         if getattr(instruction.operation, "condition", None) is not None:
             return True
         return False
@@ -122,10 +124,18 @@ class QuantumDeltaDebugger:
                 for inst in self.segments[seg_idx]["instructions"]:
                     excluded_indices.add(inst["index"])
 
+        # Extract original measurement mappings
+        original_measurements = []
+        for i, inst in enumerate(original_circuit.data):
+            if inst.operation.name == "measure":
+                q_idx = original_circuit.find_bit(inst.qubits[0]).index
+                c_idx = original_circuit.find_bit(inst.clbits[0]).index
+                original_measurements.append((q_idx, c_idx))
+
         for i, inst in enumerate(original_circuit.data):
             op = inst.operation
             qargs = inst.qubits
-            # 跳过测量及非执行指令
+            # Skip measurement and non-execution instructions
             if getattr(op, "name", None) in ["measure", "barrier", "delay", "reset"]:
                 continue
             if i in excluded_indices:
@@ -137,7 +147,11 @@ class QuantumDeltaDebugger:
                 mapped_qargs = [new_circuit.qubits[j] for j in range(len(qargs))]
             new_circuit.append(op, mapped_qargs, [])
 
-        if self.logical_n_qubits is None:
+        # Apply measurements: preserve original mappings if available
+        if original_measurements:
+            for q_idx, c_idx in original_measurements:
+                new_circuit.measure(q_idx, c_idx)
+        elif self.logical_n_qubits is None:
             new_circuit = self._ensure_measured(new_circuit)
         else:
             n = self.logical_n_qubits
@@ -159,6 +173,15 @@ class QuantumDeltaDebugger:
             new_circuit = original_circuit.copy_empty_like()
         except Exception:
             new_circuit = QuantumCircuit(original_circuit.num_qubits, original_circuit.num_clbits)
+        
+        # Extract original measurement mappings
+        original_measurements = []
+        for i, inst in enumerate(original_circuit.data):
+            if inst.operation.name == "measure":
+                q_idx = original_circuit.find_bit(inst.qubits[0]).index
+                c_idx = original_circuit.find_bit(inst.clbits[0]).index
+                original_measurements.append((q_idx, c_idx))
+        
         include_indices: set[int] = set()
         for seg_idx in include_set:
             if 0 <= seg_idx < len(self.segments):
@@ -167,7 +190,7 @@ class QuantumDeltaDebugger:
         for i, inst in enumerate(original_circuit.data):
             op = inst.operation
             qargs = inst.qubits
-            # 跳过测量及非执行指令
+            # Skip measurement and non-execution instructions
             if getattr(op, "name", None) in ["measure", "barrier", "delay", "reset"]:
                 continue
             if i not in include_indices:
@@ -178,7 +201,12 @@ class QuantumDeltaDebugger:
             except Exception:
                 mapped_qargs = [new_circuit.qubits[j] for j in range(len(qargs))]
             new_circuit.append(op, mapped_qargs, [])
-        if self.logical_n_qubits is None:
+        
+        # Apply measurements: preserve original mappings if available
+        if original_measurements:
+            for q_idx, c_idx in original_measurements:
+                new_circuit.measure(q_idx, c_idx)
+        elif self.logical_n_qubits is None:
             new_circuit = self._ensure_measured(new_circuit)
         else:
             n = self.logical_n_qubits
@@ -200,9 +228,11 @@ class QuantumDeltaDebugger:
             from collections import defaultdict
             acc = defaultdict(int)
             for k, v in (counts or {}).items():
-                # 约定使用小端序：bitstring 右端为最高编号量子比特；目标态也需按小端提供
-                bits_le = k.replace(" ", "")[::-1]
-                acc[bits_le[:n_bits]] += v
+                # Qiskit uses big-endian: remove spaces, take first n_bits (corresponding to lower-numbered qubits)
+                bits = k.replace(" ", "")
+                # Keep only the first n_bits (corresponding to qubits 0 to n_bits-1)
+                if len(bits) >= n_bits:
+                    acc[bits[:n_bits]] += v
             return dict(acc)
 
         n_data = self.logical_n_qubits or circuit.num_qubits
@@ -214,14 +244,15 @@ class QuantumDeltaDebugger:
         total_ideal = max(1, sum(ideal_counts.values()))
 
         def _key(state: int) -> str:
+            # Qiskit big-endian: generate standard binary string
             return format(state, f"0{n_data}b")
 
         ideal_target_prob = sum(ideal_counts.get(_key(s), 0) for s in self.target_states) / total_ideal
 
-        noisy = self.executor.run_circuit(circuit, execution_type="real_device", shots=shots)
+        noisy = self.executor.run_circuit(circuit, execution_type=self.noisy_execution_type, shots=shots)
         if not noisy.get("success"):
-            # 一次重试，仍失败则抛错，避免把失败当作 0 概率
-            noisy = self.executor.run_circuit(circuit, execution_type="real_device", shots=shots)
+            # Retry once; if still fails, throw error to avoid treating failure as 0 probability
+            noisy = self.executor.run_circuit(circuit, execution_type=self.noisy_execution_type, shots=shots)
         if not noisy.get("success"):
             raise RuntimeError(f"Noisy simulation failed: {noisy.get('error')}")
         noisy_counts = _project_counts(noisy.get("counts", {}), n_data)
@@ -238,7 +269,7 @@ class QuantumDeltaDebugger:
         full_circuit = self.build_circuit_without_segments(self.original_circuit, [])
         full_ideal, full_noisy, _ = self.evaluate_circuit(full_circuit, shots=shots)
         loss = full_ideal - full_noisy if baseline_loss is None else baseline_loss
-        # 清空 ddmin 日志
+        # Clear ddmin log
         self.ddmin_log.clear()
 
         candidates = list(range(len(self.segments)))
@@ -254,7 +285,7 @@ class QuantumDeltaDebugger:
                 t_ideal, t_noisy, _ = self.evaluate_circuit(test_circ, shots=shots)
                 t_loss = t_ideal - t_noisy
                 tol_t = self._adaptive_tol(shots, 0.5 * (t_ideal + t_noisy))
-                # 记录 ddmin 评估
+                # Record ddmin evaluation
                 self.evaluations.append({
                     "mode": "ddmin",
                     "excluded": subset,
@@ -267,7 +298,7 @@ class QuantumDeltaDebugger:
                 log_entry = {
                     "action": "test_subset",
                     "excluded": subset,
-                    "kept": [i for i in candidates if i in subset],
+                    "kept": complement,
                     "ideal": t_ideal,
                     "noisy": t_noisy,
                     "loss": t_loss,
@@ -282,12 +313,12 @@ class QuantumDeltaDebugger:
                     self.ddmin_log.append(log_entry)
                     progressed = True
                     break
-                # 尝试测 complement
+                # Try testing complement
                 comp_circ = self.build_circuit_without_segments(self.original_circuit, complement)
                 c_ideal, c_noisy, _ = self.evaluate_circuit(comp_circ, shots=shots)
                 c_loss = c_ideal - c_noisy
                 tol_c = self._adaptive_tol(shots, 0.5 * (c_ideal + c_noisy))
-                # 记录 ddmin 评估（complement）
+                # Record ddmin evaluation (complement)
                 self.evaluations.append({
                     "mode": "ddmin",
                     "excluded": complement,
@@ -300,7 +331,7 @@ class QuantumDeltaDebugger:
                 log_entry_comp = {
                     "action": "test_complement",
                     "excluded": complement,
-                    "kept": [i for i in candidates if i in subset],
+                    "kept": subset,
                     "ideal": c_ideal,
                     "noisy": c_noisy,
                     "loss": c_loss,
@@ -315,7 +346,7 @@ class QuantumDeltaDebugger:
                     self.ddmin_log.append(log_entry_comp)
                     progressed = True
                     break
-                # 两者都未推进，记录两条日志
+                # Both did not progress, record both logs
                 self.ddmin_log.append(log_entry)
                 self.ddmin_log.append(log_entry_comp)
             if not progressed:
@@ -346,7 +377,7 @@ class QuantumDeltaDebugger:
         n_seg = len(self.segments)
         curve: List[Dict[str, Any]] = []
         for i in range(n_seg):
-            include = list(range(i + 1))  # 前 i 层（含）
+            include = list(range(i + 1))  # First i layers (inclusive)
             test = self.build_circuit_with_segments(self.original_circuit, include)
             p_ideal, p_noisy, _ = self.evaluate_circuit(test, shots=shots)
             loss = p_ideal - p_noisy
@@ -357,7 +388,7 @@ class QuantumDeltaDebugger:
                 "noisy": p_noisy,
                 "loss": loss,
             })
-            # 记录 prefix 评估
+            # Record prefix evaluation
             self.evaluations.append({
                 "mode": "prefix",
                 "excluded": None,
@@ -367,7 +398,7 @@ class QuantumDeltaDebugger:
                 "noisy": p_noisy,
                 "loss": loss,
             })
-        # 查找相邻差分的最大上升（spike）
+        # Find maximum increase (spike) in adjacent differences
         spike_idx = None
         spike_delta = 0.0
         for k in range(1, len(curve)):
@@ -377,7 +408,7 @@ class QuantumDeltaDebugger:
                 spike_idx = k
         return {
             "curve": curve,  # [(layer_idx, loss)]
-            "spike_index": spike_idx,  # None 或 首次显著突增的层索引
+            "spike_index": spike_idx,  # None or first layer index with significant spike
             "spike_delta": spike_delta,
         }
 
@@ -397,11 +428,11 @@ class QuantumDeltaDebugger:
 
         self.segments = self.extract_circuit_segments(circuit)
 
-        # 先获得基线损失用于报告
+        # First get baseline loss for reporting
         full = self.build_circuit_without_segments(self.original_circuit, [])
         base_ideal, base_noisy, _ = self.evaluate_circuit(full)
         baseline_loss = base_ideal - base_noisy
-        # 记录 baseline 评估
+        # Record baseline evaluation
         self.evaluations.append({
             "mode": "baseline",
             "excluded": [],
@@ -418,12 +449,13 @@ class QuantumDeltaDebugger:
         meta = {
             "timestamp": datetime.now().isoformat(),
             "logical_n_qubits": self.logical_n_qubits,
-            "bit_endianness": "little (Qiskit bitstrings), reversed to logical order",
+            "bit_endianness": "big (Qiskit standard): bitstring[0] = qubit 0, bitstring[i] = qubit i",
             "evaluation": {
                 "shots_ddmin": 2048,
                 "tolerance_base": self.tolerance,
                 "tolerance_mode": "adaptive_2sigma",
                 "noisy_retry": 1,
+                "noisy_execution_type": self.noisy_execution_type,
             },
         }
 
@@ -492,19 +524,39 @@ def run_delta_debug_on_isa(
     n_qubits: int,
     marked_states: Sequence[int],
     tolerance: float = 0.02,
+    noisy_execution_type: str = "real_device",
 ) -> Dict[str, Any]:
-    dbg = QuantumDeltaDebugger(executor=executor, target_states=marked_states, tolerance=tolerance)
+    """
+    Run Delta Debug analysis
+    
+    Args:
+        executor: Quantum circuit executor
+        isa_circuit: ISA-compiled quantum circuit
+        n_qubits: Number of logical qubits
+        marked_states: List of target states (integers)
+        tolerance: Tolerance threshold
+        noisy_execution_type: Noisy execution type, either "real_device" or "noisy_simulator"
+    
+    Returns:
+        Debug result dictionary
+    """
+    dbg = QuantumDeltaDebugger(
+        executor=executor,
+        target_states=marked_states,
+        tolerance=tolerance,
+        noisy_execution_type=noisy_execution_type
+    )
     result = dbg.debug_circuit(isa_circuit, n_qubits=n_qubits, target_states=marked_states)
-    # 同时进行前缀扫描以检测 spike
+    # Also perform prefix scan to detect spikes
     scan_shots = 512
     loss_scan = dbg.scan_loss_by_prefix(shots=scan_shots)
     result["loss_scan"] = loss_scan
-    # 更新 meta 中的前缀扫描 shots
+    # Update prefix scan shots in meta
     try:
         result["meta"]["evaluation"]["shots_prefix_scan"] = scan_shots
     except Exception:
         pass
-    # 自动保存报告
+    # Automatically save report
     dbg.save_debug_report(result)
     return result
 
